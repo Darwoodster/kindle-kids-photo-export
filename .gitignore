@@ -1,0 +1,9 @@
+build/
+mail_capture/
+kindle_uri_mail_checkpoint.json
+kindle_email_unreadable.jsonl
+*.keystore
+*.jks
+.DS_Store
+__pycache__/
+*.pyc

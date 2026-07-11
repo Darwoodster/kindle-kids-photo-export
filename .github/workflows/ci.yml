@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Python and shell
+        run: |
+          python3 -m py_compile local_mail_bridge.py run_kindle_uri_mail_batches.py tests/test_bridge.py
+          zsh -n forward_kindle_email_batch.sh build_apk.sh
+          python3 -m unittest discover -s tests -v
