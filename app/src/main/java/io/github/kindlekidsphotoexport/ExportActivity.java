@@ -9,12 +9,15 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.StatFs;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileWriter;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -24,9 +27,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Exposes protected Amazon Kids camera MediaStore URIs to the built-in Fire
- * Email composer. Email then reads the granted URIs and sends the originals to
- * a local SMTP capture server reached through an ADB reverse tunnel.
+ * Copies protected Amazon Kids camera MediaStore items to a temporary public
+ * Download directory for an ADB pull, or exposes their URIs to the built-in
+ * Fire Email composer for the original local SMTP capture workflow.
  */
 public final class ExportActivity extends Activity {
     private static final String TAG = "KidsPhotoExport";
@@ -40,12 +43,14 @@ public final class ExportActivity extends Activity {
         final int mediaType;
         final String name;
         final long dateAdded;
+        final long size;
 
-        MediaRef(long id, int mediaType, String name, long dateAdded) {
+        MediaRef(long id, int mediaType, String name, long dateAdded, long size) {
             this.id = id;
             this.mediaType = mediaType;
             this.name = name;
             this.dateAdded = dateAdded;
+            this.size = size;
         }
     }
 
@@ -61,6 +66,8 @@ public final class ExportActivity extends Activity {
             public void run() {
                 if (intent.getBooleanExtra("list_profiles", false)) {
                     listProfiles();
+                } else if (intent.getBooleanExtra("copy_to_download", false)) {
+                    copyMediaToDownload(intent);
                 } else if (intent.getBooleanExtra("forward_to_email", false)) {
                     forwardMediaToEmail(intent);
                 } else {
@@ -71,6 +78,130 @@ public final class ExportActivity extends Activity {
         }, "kindle-kids-photo-export").start();
     }
 
+    private void copyMediaToDownload(Intent intent) {
+        String profile = intent.getStringExtra("profile_name");
+        String outputName = intent.getStringExtra("output_dir");
+        if (profile == null || profile.length() == 0
+                || profile.contains("/") || profile.contains("..")) {
+            showStatus("A valid profile_name is required.");
+            Log.e(TAG, "Missing or invalid profile_name");
+            return;
+        }
+        if (outputName == null || outputName.length() == 0) {
+            outputName = EXPORT_DIR;
+        }
+        if (outputName.contains("/") || outputName.contains("..")) {
+            showStatus("A valid output_dir is required.");
+            Log.e(TAG, "Missing or invalid output_dir");
+            return;
+        }
+
+        List<MediaRef> refs = new ArrayList<>();
+        String selection = MediaStore.MediaColumns.DATA + " LIKE ? AND ("
+                + MediaStore.Files.FileColumns.MEDIA_TYPE + "=? OR "
+                + MediaStore.Files.FileColumns.MEDIA_TYPE + "=?)";
+        String[] args = {
+                KIDS_ROOT + profile + "/%",
+                Integer.toString(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE),
+                Integer.toString(MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)
+        };
+        try (Cursor cursor = queryKidsMedia(selection, args)) {
+            if (cursor == null) {
+                throw new IllegalStateException("MediaStore returned no cursor");
+            }
+            int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID);
+            int typeColumn = cursor.getColumnIndexOrThrow(
+                    MediaStore.Files.FileColumns.MEDIA_TYPE);
+            int nameColumn = cursor.getColumnIndexOrThrow(
+                    MediaStore.MediaColumns.DISPLAY_NAME);
+            int dateColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED);
+            int sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE);
+            while (cursor.moveToNext()) {
+                refs.add(new MediaRef(cursor.getLong(idColumn), cursor.getInt(typeColumn),
+                        cursor.getString(nameColumn), cursor.getLong(dateColumn),
+                        cursor.getLong(sizeColumn)));
+            }
+        } catch (Exception error) {
+            Log.e(TAG, "Unable to query direct-copy batch", error);
+            showStatus("Unable to query media:\n" + error.getMessage());
+            return;
+        }
+
+        Collections.sort(refs, new Comparator<MediaRef>() {
+            @Override
+            public int compare(MediaRef left, MediaRef right) {
+                if (left.dateAdded != right.dateAdded) {
+                    return left.dateAdded > right.dateAdded ? -1 : 1;
+                }
+                return left.id == right.id ? 0 : (left.id > right.id ? -1 : 1);
+            }
+        });
+
+        File root = new File(Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS), outputName);
+        root.mkdirs();
+        long declaredBytes = 0;
+        for (MediaRef ref : refs) {
+            declaredBytes += Math.max(0, ref.size);
+        }
+        long availableBytes = new StatFs(root.getAbsolutePath()).getAvailableBytes();
+        if (declaredBytes > availableBytes) {
+            Log.e(TAG, "COPY_ABORT reason=NO_SPACE expected_bytes=" + declaredBytes
+                    + " available_bytes=" + availableBytes + " output="
+                    + root.getAbsolutePath());
+            showStatus("Not enough free tablet storage for direct staging\nRequired: "
+                    + declaredBytes + " bytes\nAvailable: " + availableBytes + " bytes");
+            return;
+        }
+        int copied = 0;
+        int failed = 0;
+        long totalBytes = 0;
+        for (int index = 0; index < refs.size(); index++) {
+            MediaRef ref = refs.get(index);
+            Uri collection = ref.mediaType == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO
+                    ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                    : MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+            Uri uri = ContentUris.withAppendedId(collection, ref.id);
+            String filename = ref.name == null || ref.name.length() == 0
+                    ? Long.toString(ref.id) : new File(ref.name).getName();
+            File target = new File(root, filename);
+            if (target.exists()) {
+                target = new File(root, ref.id + "__" + filename);
+            }
+            long bytes = 0;
+            try (InputStream input = getContentResolver().openInputStream(uri);
+                 FileOutputStream output = new FileOutputStream(target)) {
+                if (input == null) {
+                    throw new IllegalStateException("MediaStore returned no stream");
+                }
+                byte[] buffer = new byte[1024 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                    bytes += read;
+                }
+                if (ref.dateAdded > 0) {
+                    target.setLastModified(ref.dateAdded * 1000L);
+                }
+                copied++;
+                totalBytes += bytes;
+                Log.i(TAG, "COPY_OK index=" + index + " id=" + ref.id
+                        + " bytes=" + bytes + " name=" + filename);
+            } catch (Exception error) {
+                failed++;
+                target.delete();
+                Log.e(TAG, "COPY_FAIL index=" + index + " id=" + ref.id
+                        + " name=" + filename, error);
+            }
+        }
+        Log.i(TAG, "COPY_COMPLETE profile=" + profile + " expected=" + refs.size()
+                + " copied=" + copied + " failed=" + failed + " bytes=" + totalBytes
+                + " output=" + root.getAbsolutePath());
+        showStatus("Direct USB staging complete\nProfile: " + profile
+                + "\nCopied: " + copied + " / " + refs.size()
+                + "\nFailed: " + failed + "\nBytes: " + totalBytes);
+    }
+
     private Cursor queryKidsMedia(String selection, String[] selectionArgs) {
         Uri files = MediaStore.Files.getContentUri("external");
         String[] projection = {
@@ -78,7 +209,8 @@ public final class ExportActivity extends Activity {
                 MediaStore.Files.FileColumns.MEDIA_TYPE,
                 MediaStore.MediaColumns.DATA,
                 MediaStore.MediaColumns.DISPLAY_NAME,
-                MediaStore.MediaColumns.DATE_ADDED
+                MediaStore.MediaColumns.DATE_ADDED,
+                MediaStore.MediaColumns.SIZE
         };
         return getContentResolver().query(files, projection, selection,
                 selectionArgs, null);
@@ -166,12 +298,14 @@ public final class ExportActivity extends Activity {
             int nameColumn = cursor.getColumnIndexOrThrow(
                     MediaStore.MediaColumns.DISPLAY_NAME);
             int dateColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED);
+            int sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE);
             while (cursor.moveToNext()) {
                 refs.add(new MediaRef(
                         cursor.getLong(idColumn),
                         cursor.getInt(typeColumn),
                         cursor.getString(nameColumn),
-                        cursor.getLong(dateColumn)));
+                        cursor.getLong(dateColumn),
+                        cursor.getLong(sizeColumn)));
             }
         } catch (Exception error) {
             Log.e(TAG, "Unable to prepare Email forwarding batch", error);

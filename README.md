@@ -9,6 +9,47 @@ camera items. Fire Email sends them to a tiny SMTP capture server on your Mac
 through an **ADB USB reverse tunnel**. Nothing is uploaded to Amazon, an email
 provider, or the internet.
 
+Windows users can use the direct USB workflow in
+[`export_kindle_kids_media_windows.ps1`](export_kindle_kids_media_windows.ps1).
+It requires no Email account or mail server: the helper stages originals in a
+temporary tablet Download directory, PowerShell verifies and pulls them over
+ADB, and successful runs remove the temporary copy.
+
+### Windows quick start (direct USB, no Email setup)
+
+Open PowerShell in this repository. With one unlocked, ADB-authorized tablet
+connected, list the protected Kids camera profiles:
+
+```powershell
+.\export_kindle_kids_media_windows.ps1 -ListProfiles
+```
+
+Then export one exact profile name directly into its destination folder:
+
+```powershell
+.\export_kindle_kids_media_windows.ps1 `
+  -Profile 'CHILD_PROFILE_NAME' `
+  -Destination 'H:\Kids Photos\CHILD_PROFILE_NAME'
+```
+
+If a phone or second tablet is also connected, add the serial shown by
+`adb devices`, for example `-Serial 'GCC19D06217303RR'`.
+
+The script verifies the tablet-side count and total bytes before placing only
+media files in the destination. Existing identical files are not duplicated;
+same-name files with different contents receive a short SHA-256 suffix. On a
+failure, staging is preserved for diagnosis instead of being silently deleted.
+Direct staging temporarily requires enough free tablet storage for the full
+profile. The helper checks this before copying and reports the required and
+available byte counts instead of filling the device partway.
+
+To rebuild the helper with Android Studio's bundled JDK and an installed
+Android SDK:
+
+```powershell
+.\build_apk.ps1 -PublishArtifact
+```
+
 > This is an involved recovery method for media you own and can view locally.
 > Test with one photo first. It never needs root access and the supplied code
 > never deletes media from the tablet.
@@ -141,6 +182,48 @@ PROFILE_FOUND name=CHILD_PROFILE_NAME total=NUMBER
 Keep the exact `name` and `total`. No profile name is transmitted off the Mac
 or tablet.
 
+## Alternative: direct ADB copy
+
+Some older Fire Email versions do not expose custom POP3/SMTP port fields. The
+helper can instead stage the originals in a temporary public Download directory
+so `adb pull` can copy them directly over USB. This mode does not require an
+Email account, the Python capture bridge, an ADB reverse tunnel, or internet
+access.
+
+Choose a new output directory name for each export and replace
+`CHILD_PROFILE_NAME` exactly:
+
+```sh
+adb logcat -c
+adb shell am start --user 0 -S -W \
+  -n io.github.kindlekidsphotoexport/.ExportActivity \
+  --ez copy_to_download true \
+  --es profile_name 'CHILD_PROFILE_NAME' \
+  --es output_dir 'Kindle-Kids-Photo-Export-CHILD'
+```
+
+Wait for the helper to finish, then verify the summary before pulling files:
+
+```sh
+adb logcat -d -s KidsPhotoExport:I KidsPhotoExport:E '*:S'
+adb pull \
+  '/storage/emulated/0/Download/Kindle-Kids-Photo-Export-CHILD/.' \
+  './CHILD_PROFILE_NAME'
+```
+
+The final log entry reports `expected`, `copied`, `failed`, and total `bytes`.
+Do not claim a complete recovery unless `copied` equals `expected` and
+`failed=0`. After verifying the pulled files and making a second backup, remove
+only the temporary directory you named:
+
+```sh
+adb shell rm -rf \
+  '/storage/emulated/0/Download/Kindle-Kids-Photo-Export-CHILD'
+```
+
+The Email workflow below remains useful on devices where MediaStore refuses a
+direct stream but permits Fire Email to read a granted URI.
+
 ## Step 5: test one original photo
 
 Terminal window 1 must still show the capture bridge running. In Terminal
@@ -246,6 +329,9 @@ any changes to the tablet.
   the helper was installed with `-g`, and the command used Android user 0.
 - **Email account setup fails:** ensure the Python bridge is running and both
   ADB reverse mappings exist before adding the account.
+- **Email has no custom port fields:** use the direct ADB copy alternative
+  above. Its completion log provides an explicit per-file success/failure
+  result.
 - **Message remains in Outbox:** wait. The runner foregrounds Email to kick the
   queue. Do not press Send repeatedly.
 - **Fire Email crashes:** reduce `--batch-size` to 50 and resume from the same
